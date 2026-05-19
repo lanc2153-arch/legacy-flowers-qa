@@ -775,12 +775,12 @@ def subir_fotos(archivos: list, finca: str, fecha: str) -> list:
             ts = datetime.now().strftime("%H%M%S")
             nombre = f"{fecha}_{finca}_foto{i+1}_{ts}.jpg".replace(" ", "_")
             datos = archivo.getvalue()
-            sb.storage.from_("Evidencias").upload(
+            sb.storage.from_("evidencias").upload(
                 path=nombre,
                 file=datos,
                 file_options={"content-type": "image/jpeg"}
             )
-            url_result = sb.storage.from_("Evidencias").get_public_url(nombre)
+            url_result = sb.storage.from_("evidencias").get_public_url(nombre)
             # get_public_url puede retornar string o dict
             if isinstance(url_result, dict):
                 url = url_result.get("publicUrl", url_result.get("data", {}).get("publicUrl", ""))
