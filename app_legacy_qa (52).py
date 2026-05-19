@@ -168,6 +168,7 @@ def save_to_supabase(record: dict):
         "porc_nc": record["porc_nc"], "porc_c": record["porc_c"],
         "obs_generales": record["obs_generales"],
         "firma_auditor": record["firma_auditor"], "firma_resp": record["firma_resp"],
+        "fotos": record.get("fotos", "[]"),
     }
     for crit, col in COL_PROD.items():
         d = record["prod_data"][crit]
@@ -685,8 +686,111 @@ def generar_pdf(record: dict) -> bytes:
                 story.append(Image(img_global_causas, width=18*cm, height=10*cm))
 
 
+    # ── EVIDENCIA FOTOGRÁFICA ─────────────────────────────────
+    fotos_urls = []
+    try:
+        fotos_raw = record.get("fotos", "[]")
+        if isinstance(fotos_raw, list):
+            fotos_urls = fotos_raw
+        elif isinstance(fotos_raw, str):
+            fotos_urls = json.loads(fotos_raw) if fotos_raw and fotos_raw != "[]" else []
+    except:
+        fotos_urls = []
+
+    story.append(PageBreak())
+    story.append(Paragraph("EVIDENCIA FOTOGRÁFICA", sec))
+    story.append(Spacer(1, 0.3*cm))
+
+    if fotos_urls:
+        story.append(Paragraph(
+            f"Total de fotos: {len(fotos_urls)} | Fecha: {record['fecha']} | Finca: {record['finca']}",
+            ParagraphStyle("info_fotos", parent=styles["Normal"],
+                           fontSize=9, textColor=colors.HexColor("#555555"),
+                           spaceAfter=10)))
+
+        import urllib.request
+        foto_imgs = []
+        errores_foto = []
+        for idx, url in enumerate(fotos_urls):
+            try:
+                foto_buf = io.BytesIO()
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                response = urllib.request.urlopen(req, timeout=10)
+                foto_buf.write(response.read())
+                foto_buf.seek(0)
+                if foto_buf.getbuffer().nbytes > 0:
+                    foto_imgs.append(foto_buf)
+            except Exception as e:
+                errores_foto.append(f"Foto {idx+1}: {str(e)[:50]}")
+
+        if foto_imgs:
+            for i in range(0, len(foto_imgs), 2):
+                row = foto_imgs[i:i+2]
+                if len(row) == 2:
+                    t_fotos = Table([[
+                        Image(row[0], width=8.5*cm, height=6.5*cm),
+                        Image(row[1], width=8.5*cm, height=6.5*cm),
+                    ]], colWidths=[9*cm, 9*cm])
+                else:
+                    t_fotos = Table([[
+                        Image(row[0], width=8.5*cm, height=6.5*cm), ""
+                    ]], colWidths=[9*cm, 9*cm])
+                t_fotos.setStyle(TableStyle([
+                    ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+                    ("ALIGN",  (0,0), (-1,-1), "CENTER"),
+                    ("BOX",    (0,0), (-1,-1), 0.3, colors.HexColor("#dddddd")),
+                ]))
+                story.append(t_fotos)
+                story.append(Spacer(1, 0.3*cm))
+        else:
+            story.append(Paragraph(
+                f"Se registraron {len(fotos_urls)} foto(s) pero no se pudieron cargar en el PDF.",
+                ParagraphStyle("err_fotos", parent=styles["Normal"],
+                               fontSize=9, textColor=colors.HexColor("#c0392b"))))
+            for err in errores_foto:
+                story.append(Paragraph(f"• {err}",
+                    ParagraphStyle("err_det", parent=styles["Normal"],
+                                   fontSize=8, textColor=colors.HexColor("#888888"))))
+    else:
+        story.append(Paragraph(
+            "No se registraron fotos de evidencia para este checklist.",
+            ParagraphStyle("sin_fotos", parent=styles["Normal"],
+                           fontSize=9, textColor=colors.HexColor("#888888"),
+                           fontName="Helvetica-Oblique")))
+
     doc.build(story)
     return buf.getvalue()
+
+
+# ═══════════════════════════════════════════
+# 📸  SUBIDA DE FOTOS A SUPABASE STORAGE
+# ═══════════════════════════════════════════
+def subir_fotos(archivos: list, finca: str, fecha: str) -> list:
+    """Sube fotos a Supabase Storage y retorna lista de URLs."""
+    sb = get_supabase()
+    urls = []
+    for i, archivo in enumerate(archivos):
+        try:
+            # camera_input no tiene .name, usamos timestamp + índice
+            ts = datetime.now().strftime("%H%M%S")
+            nombre = f"{fecha}_{finca}_foto{i+1}_{ts}.jpg".replace(" ", "_")
+            datos = archivo.getvalue()
+            sb.storage.from_("Evidencias").upload(
+                path=nombre,
+                file=datos,
+                file_options={"content-type": "image/jpeg"}
+            )
+            url_result = sb.storage.from_("Evidencias").get_public_url(nombre)
+            # get_public_url puede retornar string o dict
+            if isinstance(url_result, dict):
+                url = url_result.get("publicUrl", url_result.get("data", {}).get("publicUrl", ""))
+            else:
+                url = str(url_result)
+            if url:
+                urls.append(url)
+        except Exception as e:
+            st.warning(f"No se pudo subir foto {i+1}: {e}")
+    return urls
 
 
 # ═══════════════════════════════════════════
@@ -879,9 +983,29 @@ def render_form():
         </div>""", unsafe_allow_html=True)
     st.divider()
 
-    obs_gen       = st.text_area("Observaciones Generales", key=f"obs_gen_{fk}")
-    firma_auditor = st.text_input("Firma Auditor",          key=f"firma_auditor_{fk}")
-    firma_resp    = st.text_input("Firma Responsable",      key=f"firma_resp_{fk}")
+    obs_gen = st.text_area("Observaciones Generales", key=f"obs_gen_{fk}")
+
+    st.markdown('<div class="section-title">📸 EVIDENCIA FOTOGRÁFICA</div>',
+                unsafe_allow_html=True)
+    st.caption("Toma hasta 40 fotos de evidencia una por una")
+
+    fotos_subidas = []
+    num_fotos = st.number_input("¿Cuántas fotos vas a tomar?", 
+                                 min_value=0, max_value=40, step=1, 
+                                 key=f"num_fotos_{fk}")
+    
+    for i in range(int(num_fotos)):
+        foto = st.camera_input(f"📷 Foto {i+1}", key=f"foto_{fk}_{i}")
+        if foto:
+            fotos_subidas.append(foto)
+            st.success(f"✅ Foto {i+1} tomada")
+
+    if fotos_subidas:
+        st.markdown(f"<small style='color:#4a6fa5;'>{len(fotos_subidas)} foto(s) lista(s)</small>",
+                    unsafe_allow_html=True)
+
+    firma_auditor = st.text_input("Firma Auditor",     key=f"firma_auditor_{fk}")
+    firma_resp    = st.text_input("Firma Responsable", key=f"firma_resp_{fk}")
 
     if st.button("💾 GUARDAR CHECKLIST", type="primary", use_container_width=True):
         record = {
@@ -906,14 +1030,28 @@ def render_form():
             for err in errores_causas:
                 st.markdown(f"• {err}")
 
+        # Subir fotos ANTES de guardar
+        foto_urls = []
+        if fotos_subidas:
+            with st.spinner(f"Subiendo {len(fotos_subidas)} foto(s)... por favor espera"):
+                try:
+                    foto_urls = subir_fotos(fotos_subidas, finca, str(fecha))
+                    st.success(f"✅ {len(foto_urls)} foto(s) subidas correctamente")
+                except Exception as e:
+                    st.error(f"❌ Error al subir fotos: {e}")
+                    foto_urls = []
+
+        record["fotos"] = json.dumps(foto_urls)
+
         try:
             save_to_supabase(record)
-            st.session_state["ultimo_record"] = record
+            # Guardar record completo con fotos ANTES del rerun
+            st.session_state["ultimo_record"] = record.copy()
             st.session_state["guardado_ok"] = True
             st.session_state["form_key"] = st.session_state.get("form_key", 0) + 1
             st.rerun()
         except Exception as e:
-            st.error(f"❌ Error al guardar: {e}")
+            st.error(f"❌ Error al guardar en base de datos: {e}")
     
     # Mostrar mensaje de éxito después del rerun
     if st.session_state.get("guardado_ok"):
@@ -949,18 +1087,32 @@ def _row_to_record(row) -> dict:
         "causas_ramos": _parse_causas_json(row.get(f"mat_{col}_causas","")),
         "causas":      list(_parse_causas_json(row.get(f"mat_{col}_causas","")).keys()),
     } for c,col in COL_MAT.items()}
+
+    # Recuperar fotos correctamente
+    fotos_raw = row.get("fotos", "[]") or "[]"
+    if isinstance(fotos_raw, list):
+        fotos_val = json.dumps(fotos_raw)
+    else:
+        fotos_val = fotos_raw
+
     return {**row, "prod_data":prod_data, "mat_data":mat_data,
             "ramos_eval":   int(row.get("ramos_eval",1) or 1),
             "porc_muestra": float(row.get("porc_muestra",0) or 0),
             "total_fallas": int(row.get("total_fallas",0) or 0),
             "porc_nc":      float(row.get("porc_nc",0) or 0),
-            "porc_c":       float(row.get("porc_c",100) or 100)}
+            "porc_c":       float(row.get("porc_c",100) or 100),
+            "fotos":        fotos_val}
 
 def render_dashboard():
     st.markdown('<div class="section-title">📈 HISTORIAL Y GENERACIÓN DE PDF</div>',
                 unsafe_allow_html=True)
     if "ultimo_record" in st.session_state:
-        st.info("📄 Último checklist guardado listo para exportar:")
+        rec_actual = st.session_state["ultimo_record"]
+        fotos_count = len(json.loads(rec_actual.get("fotos", "[]")))
+        msg = f"📄 Último checklist guardado"
+        if fotos_count > 0:
+            msg += f" ({fotos_count} foto(s) incluidas)"
+        st.info(msg + " — listo para exportar:")
         if st.button("📥 Generar PDF del último checklist"):
             with st.spinner("Generando PDF…"):
                 pdf = generar_pdf(st.session_state["ultimo_record"])
